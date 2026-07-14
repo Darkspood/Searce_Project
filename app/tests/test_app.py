@@ -2,6 +2,12 @@
 Integration tests for app.py, driven through Streamlit's official AppTest
 harness (streamlit.testing.v1) — runs the real UI script headlessly, without
 a browser, and lets us click/type/select exactly like a user would.
+
+None of these tests make a real Claude API call or a real weather call.
+`llm_context_engine.get_target_vector` (or, for one test, just its
+`_get_client` seam) is monkeypatched — the real LLM path isn't reproducible
+in CI, so exact-value assertions are always made against a forced
+deterministic path instead.
 """
 
 from datetime import datetime
@@ -9,11 +15,29 @@ from pathlib import Path
 
 from streamlit.testing.v1 import AppTest
 
-from context_engine import compute_target_vector, get_time_bucket
-from dishes import DISHES
+import llm_context_engine
+from context_engine import get_time_bucket
+from dishes import DIMENSIONS, DISHES
 from matching_engine import rank_dishes
 
 APP_PATH = str(Path(__file__).resolve().parent.parent / "app.py")
+
+
+def _fake_get_target_vector(vector=None, rationale=None, source="fallback", error="forced for test"):
+    """Builds a fake replacement for llm_context_engine.get_target_vector."""
+    base_vector = {dim: 5 for dim in DIMENSIONS}
+    if vector:
+        base_vector.update(vector)
+    base_rationale = {dim: f"stub rationale for {dim}" for dim in DIMENSIONS}
+    if rationale:
+        base_rationale.update(rationale)
+
+    def _fake(payload):
+        return llm_context_engine.ContextResult(
+            base_vector, base_rationale, source=source, error=None if source == "llm" else error
+        )
+
+    return _fake
 
 
 def test_app_runs_without_raising():
@@ -26,82 +50,132 @@ def test_default_state_shows_empty_state_prompt():
     at = AppTest.from_file(APP_PATH)
     at.run()
     assert any("Find My Meal" in m.value for m in at.markdown)
-    # No mood is pre-selected.
-    assert at.radio[0].value is None
+    # No quiz question is pre-answered.
+    assert at.radio(key="energy_level").value is None
 
 
-def test_find_my_meal_with_no_selections_still_returns_five_results():
+def test_find_my_meal_with_no_selections_still_returns_five_results(monkeypatch):
+    monkeypatch.setattr(llm_context_engine, "get_target_vector", _fake_get_target_vector())
     at = AppTest.from_file(APP_PATH)
     at.run()
-    at.button[0].click().run()
+    at.button(key="find_meal_btn").click().run()
     assert not at.exception
     assert sum(1 for m in at.markdown if m.value.startswith("### ")) == 5
 
 
-def test_full_scenario_matches_independently_computed_expected_top_result():
+def test_fallback_banner_appears_when_llm_call_fails(monkeypatch):
+    monkeypatch.setattr(
+        llm_context_engine,
+        "get_target_vector",
+        _fake_get_target_vector(source="fallback", error="simulated outage"),
+    )
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    at.button(key="find_meal_btn").click().run()
+
+    assert not at.exception
+    assert any("fallback" in w.value.lower() for w in at.warning)
+    # The raw error is surfaced in the debug expander, not hidden.
+    assert any("simulated outage" in c.value for c in at.code)
+
+
+def test_mocked_happy_path_shows_no_fallback_banner_and_surfaces_llm_rationale(monkeypatch):
+    # An all-zero vector except spice guarantees explain_match's top dimension
+    # is deterministically "spice" for every result (any other dimension's
+    # target*dish product is 0), so the LLM-authored rationale is guaranteed
+    # to surface regardless of exactly which 5 dishes rank highest.
+    vector = {dim: 0 for dim in DIMENSIONS}
+    vector["spice"] = 10
+    rationale = {dim: f"stub rationale for {dim}" for dim in DIMENSIONS}
+    rationale["spice"] = "You wanted something bold and intense, so spice leads."
+
+    monkeypatch.setattr(
+        llm_context_engine,
+        "get_target_vector",
+        _fake_get_target_vector(vector=vector, rationale=rationale, source="llm"),
+    )
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    at.button(key="find_meal_btn").click().run()
+
+    assert not at.exception
+    assert not any("fallback" in w.value.lower() for w in at.warning)
+    assert any("bold and intense" in m.value for m in at.info)
+
+
+def test_full_scenario_matches_expected_top_result_on_the_forced_fallback_path(monkeypatch):
+    """Forces the fallback path (by making the API client unreachable) so the
+    expected top result can be computed independently, the same way
+    test_llm_context_engine.py does — the real LLM path isn't reproducible in
+    CI, so this exercises the actual fallback code path rather than a fake."""
+
+    def _raising_get_client():
+        raise RuntimeError("no network in tests")
+
+    monkeypatch.setattr(llm_context_engine, "_get_client", _raising_get_client)
+
     at = AppTest.from_file(APP_PATH)
     at.run()
 
-    at.radio[0].set_value("Stressed")
-    at.multiselect[0].set_value(["Long day at work"])
-    at.text_input[0].set_value("something crunchy and tangy")
-    at.button[0].click().run()
+    at.radio(key="energy_level").set_value("High")
+    at.radio(key="notable_activity").set_value("Just worked out")
+    at.text_input(key="craving_input").set_value("something crunchy and tangy")
+    at.button(key="find_meal_btn").click().run()
 
     assert not at.exception
     markdown_values = [m.value for m in at.markdown]
-
     signals_line = next(v for v in markdown_values if v.startswith("**Signals used:**"))
-    assert "Stressed" in signals_line
-    assert "Long day at work" in signals_line
-    assert "'tangy'" in signals_line
-    assert "'crunchy'" in signals_line
+    assert "High" in signals_line
+    assert "Just worked out" in signals_line
+    assert "crunchy and tangy" in signals_line
 
-    # The app derives its time bucket from datetime.now(), so the expected
-    # top result and score are computed here the same way rather than
-    # hardcoded — a fixed expectation would be flaky depending on what time
-    # of day the suite runs (time-of-day deltas shift every dish's score).
     time_bucket = get_time_bucket(datetime.now())
-    target_vector, _, _ = compute_target_vector(
-        time_bucket, "Stressed", ["Long day at work"], "something crunchy and tangy"
+    expected_vector, _ = llm_context_engine._fallback_vector_and_rationale(
+        time_bucket,
+        {"energy_level": "High", "notable_activity": "Just worked out"},
+        "something crunchy and tangy",
     )
-    ranked = rank_dishes(target_vector, DISHES)
+    ranked = rank_dishes(expected_vector, DISHES)
     top_entry = ranked[0]
-    top_dish, top_score = top_entry["dish"], top_entry["score"]
 
-    assert any(top_dish["name"] in v for v in markdown_values)
-    assert any(f"{top_score * 100:.1f}% similarity" in v for v in markdown_values)
+    assert any(top_entry["dish"]["name"] in v for v in markdown_values)
+    assert any(f"{top_entry['score'] * 100:.1f}% similarity" in v for v in markdown_values)
 
 
-def test_results_persist_across_an_unrelated_rerun():
+def test_results_persist_across_an_unrelated_rerun(monkeypatch):
     """Changing the craving text after clicking Find My Meal should not
     wipe the previously computed results (they live in st.session_state)."""
+    monkeypatch.setattr(llm_context_engine, "get_target_vector", _fake_get_target_vector())
     at = AppTest.from_file(APP_PATH)
     at.run()
 
-    at.radio[0].set_value("Energized")
-    at.button[0].click().run()
+    at.radio(key="energy_level").set_value("High")
+    at.button(key="find_meal_btn").click().run()
     assert any("### " in m.value for m in at.markdown)
 
     # Simulate the user typing in the craving box without clicking the
     # button again — a plain rerun, not a new search.
-    at.text_input[0].set_value("just browsing").run()
+    at.text_input(key="craving_input").set_value("just browsing").run()
 
     assert not at.exception
     assert any("Signals used" in m.value for m in at.markdown)
     assert sum(1 for m in at.markdown if m.value.startswith("### ")) == 5
 
 
-def test_different_moods_produce_different_top_results():
-    def top_result_names(mood, activities):
+def test_different_inputs_produce_different_top_results(monkeypatch):
+    def top_result_names(vector_overrides):
+        monkeypatch.setattr(
+            llm_context_engine,
+            "get_target_vector",
+            _fake_get_target_vector(vector=vector_overrides, source="llm"),
+        )
         at = AppTest.from_file(APP_PATH)
         at.run()
-        at.radio[0].set_value(mood)
-        at.multiselect[0].set_value(activities)
-        at.button[0].click().run()
+        at.button(key="find_meal_btn").click().run()
         assert not at.exception
         return [m.value for m in at.markdown if m.value.startswith("### ")]
 
-    stressed_results = top_result_names("Stressed", [])
-    energized_results = top_result_names("Energized", ["Just worked out"])
+    spicy_results = top_result_names({"spice": 10, "crunch": 10})
+    sweet_results = top_result_names({"sweetness": 10, "richness": 10})
 
-    assert stressed_results != energized_results
+    assert spicy_results != sweet_results

@@ -1,3 +1,7 @@
 streamlit
 numpy
 plotly
+anthropic
+requests
+pydantic
+python-dotenv

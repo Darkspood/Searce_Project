@@ -43,45 +43,61 @@ def test_rank_dishes_is_sorted_best_first():
 def test_explain_match_falls_back_to_broad_match_when_nothing_lines_up():
     zero_vector = {dim: 0 for dim in DIMENSIONS}
     dish = {"vector": zero_vector}
-    explanation = explain_match(zero_vector, dish, contributions=[])
+    explanation = explain_match(zero_vector, dish, rationale={})
     assert explanation == "Broad match across your current context."
 
 
-def test_explain_match_names_the_dimensions_and_the_driving_source():
+def test_explain_match_names_the_dimensions_and_the_rationale():
     target = {dim: 0 for dim in DIMENSIONS}
     target["spice"] = 8
     dish = {"vector": {dim: 0 for dim in DIMENSIONS}}
     dish["vector"]["spice"] = 9
-    contributions = [{"source": "Bored", "delta": {"spice": 2}}]
+    rationale = {"spice": "You seem bored, so a spicy kick fits the mood."}
 
-    explanation = explain_match(target, dish, contributions)
+    explanation = explain_match(target, dish, rationale)
 
     assert "Spice" in explanation
-    assert "Bored" in explanation
+    assert "bored" in explanation
     assert explanation.startswith("High ")
-    assert "driven by" in explanation
 
 
-def test_explain_match_picks_the_largest_contributor_when_several_fired():
+def test_explain_match_caps_to_two_reasons_for_readability():
     target = {dim: 0 for dim in DIMENSIONS}
     target["warmth"] = 8
+    target["richness"] = 7
+    target["umami"] = 6
     dish = {"vector": {dim: 0 for dim in DIMENSIONS}}
     dish["vector"]["warmth"] = 8
-    contributions = [
-        {"source": "Evening", "delta": {"warmth": 1}},
-        {"source": "Stressed", "delta": {"warmth": 3}},
-    ]
+    dish["vector"]["richness"] = 7
+    dish["vector"]["umami"] = 6
+    rationale = {
+        "warmth": "Reason one.",
+        "richness": "Reason two.",
+        "umami": "Reason three.",
+    }
 
-    explanation = explain_match(target, dish, contributions)
+    explanation = explain_match(target, dish, rationale)
 
-    assert "Stressed" in explanation
-    assert "Evening" not in explanation
+    assert "Reason one." in explanation
+    assert "Reason two." in explanation
+    assert "Reason three." not in explanation
+
+
+def test_explain_match_handles_a_dimension_with_no_rationale_entry():
+    target = {dim: 0 for dim in DIMENSIONS}
+    target["spice"] = 8
+    dish = {"vector": {dim: 0 for dim in DIMENSIONS}}
+    dish["vector"]["spice"] = 9
+
+    explanation = explain_match(target, dish, rationale={})
+
+    assert explanation == "High Spice match."
 
 
 def test_explain_match_never_crashes_for_any_dish_in_a_realistic_scenario():
     target = {dim: 5 for dim in DIMENSIONS}
-    contributions = [{"source": "Late Night", "delta": {"warmth": 3, "richness": 3}}]
+    rationale = {dim: f"Because of {dim}." for dim in DIMENSIONS}
     for dish in DISHES:
-        explanation = explain_match(target, dish, contributions)
+        explanation = explain_match(target, dish, rationale)
         assert isinstance(explanation, str)
         assert len(explanation) > 0
