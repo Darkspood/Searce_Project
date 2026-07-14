@@ -11,61 +11,94 @@ A single-page Streamlit prototype built for RFP 2 (Zomato) of a Searce
 internal intern assignment on AI & Digital Transformation. It's a technical
 proof-of-concept for one claim: food recommendation apps suffer from
 "Discovery Fatigue" because they (a) treat every user the same regardless of
-real-time context — mood, time of day, recent activity — and (b) categorize
-food by broad cuisine label instead of actual flavor properties.
+real-time context — weather, biometrics, mood, cravings — and (b)
+categorize food by broad cuisine label instead of actual flavor properties.
 
 The pitch: represent every dish as a 14-dimensional **flavor vector**
-instead of a cuisine tag, convert real-time context (time of day + mood +
-activity + free-text craving) into a **target flavor vector** using
-explicit, hardcoded rules, and rank dishes by **cosine similarity** between
-the two. This produces recommendations that are more personalized than
-category browsing and — critically for the "jury" pitch — fully
-explainable: every score can be traced back to specific input signals.
+instead of a cuisine tag, fuse real-time context (time of day, live
+weather, simulated smartwatch biometrics, a mood quiz, and a free-text
+craving) into a **target flavor vector**, and rank dishes by **cosine
+similarity** between the two. This produces recommendations that are more
+personalized than category browsing and — critically for the "jury" pitch
+— stay explainable: every match comes with a plain-language "why."
 
 Note: prompt.md (the original spec handed to Claude Code) asked for a
 single-file **React** app using recharts for the radar chart. What was
-actually built is a **Streamlit** app instead, split across 5 Python
-modules. Functionally it satisfies the same spec (flavor vectors, rule-based
-context engine, cosine similarity matching, radar charts, "why" explanation)
-— just a different tech stack. Worth knowing if anyone compares this repo
-back against prompt.md and wonders why the architecture doesn't match section
-4 ("UI/UX") verbatim.
+actually built is a **Streamlit** app instead, split across flat Python
+modules. Functionally it satisfies the same spec (flavor vectors, context
+fusion, cosine similarity matching, radar charts, "why" explanation) — just
+a different tech stack. Worth knowing if anyone compares this repo back
+against prompt.md and wonders why the architecture doesn't match section 4
+("UI/UX") verbatim.
 
-HARD CONSTRAINT (do not violate): no LLM/AI API calls anywhere in this app.
-All context parsing, including the free-text craving box, is rule-based
-keyword/substring matching against hardcoded delta tables. This is
-intentional — deterministic, offline, zero-latency, fully auditable in front
-of a jury. Do not "improve" the matching or text parsing by wiring in an
-OpenAI/Anthropic call or any other external inference.
+ARCHITECTURAL PIVOT (as of the "Replace rule-based context engine with
+LLM-driven flavor-vector fusion" commit): the project used to have a HARD
+CONSTRAINT of *no* LLM/AI API calls anywhere in the app — all context
+parsing, including the free-text craving box, was rule-based keyword/
+substring matching against hardcoded delta tables (mood, activity,
+keyword). That constraint has been deliberately lifted for the
+context-fusion step only. The context engine is now LLM-driven:
+llm_context_engine.py sends the full real-time context in a single call to
+Claude Sonnet 5 and gets back the 14-dim target vector plus a per-dimension
+rationale, so the "why this matched" explanation is authored by the model
+instead of hand-coded. Matching (cosine similarity, ranking) remains
+100% deterministic and untouched by this change. A deterministic fallback
+still exists for when the API call fails, so the app never crashes or goes
+silent about it — see section 2. Do not reintroduce a parallel rule-based
+context-fusion path outside llm_context_engine.py; extend its prompt/schema
+instead (see CLAUDE.md).
 
 
 2. HOW THE PIPELINE WORKS END TO END
 --------------------------------------
 1. On page load, app.py reads the current time via datetime.now() and buckets
    it into Morning / Afternoon / Evening / Late Night (context_engine.py).
-2. The user picks one mood (radio, 8 options, none pre-selected), any number
-   of activities (multiselect, 6 options), and optionally types a free-text
-   craving (e.g. "something crunchy and tangy").
-3. On clicking "Find My Meal", compute_target_vector() starts from a neutral
-   baseline (5 on all 14 dimensions) and sums in a fixed delta vector for
-   the time bucket, the selected mood, each selected activity, and every
-   keyword substring-matched in the free text — then clamps every dimension
-   to 0-10. It also returns a `contributions` list (which input contributed
-   which delta) used later for explanations.
-4. rank_dishes() computes cosine similarity between the target vector and
+2. The user optionally picks a location (PRESET_CITIES dropdown or "Custom
+   location" lat/lon) and clicks "Check Weather" — a separate, earlier step
+   from "Find My Meal" so the two network calls (weather, then LLM) don't
+   stack into one wait. weather_client.get_current_weather(lat, lon) hits
+   Open-Meteo's free current-weather endpoint and returns a dict, or None on
+   any failure (network error, timeout, malformed response) — it never
+   raises; app.py just omits weather from the payload and shows a small
+   warning.
+3. The user "connects" a simulated smartwatch via sliders (HRV, calories
+   burned, sleep score), answers some/none/all of a short mood quiz
+   (QUIZ_QUESTIONS — energy level, day descriptor, notable activity,
+   temperature preference; each optional), and optionally types a free-text
+   craving.
+4. On clicking "Find My Meal" (wrapped in st.spinner), llm_context_engine.
+   build_context_payload(...) assembles all of the above into a structured
+   dict, and get_target_vector(context_payload) sends it to Claude Sonnet 5
+   via client.messages.parse(...) with FlavorVectorResponse (a Pydantic
+   model: one DimensionScore(value, rationale) per flavor dimension) as the
+   output_format. Each DimensionScore's value is clamped to 0-10 via a
+   field_validator rather than rejecting the whole response over one
+   out-of-range number. The whole call is wrapped in a broad try/except:
+   any failure (network, rate limit, refusal, malformed response, timeout)
+   routes to a small deterministic fallback ({dim: 5} + TIME_DELTAS[bucket]
+   + a handful of fallback-only quiz-answer/keyword deltas
+   FALLBACK_QUIZ_DELTAS/FALLBACK_KEYWORD_DELTAS — intentionally much smaller
+   than the old rule-based tables, kept only so the fallback isn't flatly
+   identical for every user at the same hour). Either path always returns a
+   ContextResult(vector, rationale, source, error) — get_target_vector never
+   raises.
+5. rank_dishes() computes cosine similarity between the target vector and
    all 40 dishes' vectors (matching_engine.py, numpy) and sorts best-first;
-   the app takes the top 5.
-5. explain_match() finds the 2-3 dimensions with the highest
-   target*dish product per result, and for each one finds whichever input
-   contributed the largest positive delta to it — producing a string like
-   "High Warmth + Richness match — driven by Late Night and Stressed."
-6. Each of the 5 results is rendered as a card: name, cuisine, prep time,
+   the app takes the top 5. This step is unchanged by the LLM pivot.
+6. explain_match(target_vector, dish, rationale) finds the top 2-3
+   dimensions by target*dish product per result (still deterministic and
+   instant, no LLM call at explain-time) and pulls the "why this matched"
+   text from rationale[dim] — the per-dimension strings authored by the
+   LLM, or by the deterministic fallback when the LLM call failed.
+7. Each of the 5 results is rendered as a card: name, cuisine, prep time,
    similarity %, a Plotly radar chart of the dish's own 14-dim vector
-   (charts.py), and the explanation string.
-7. Because Streamlit reruns the whole script on every widget interaction,
-   results are cached in st.session_state.results on button click so they
-   survive unrelated reruns (e.g. typing further in the craving box)
-   instead of vanishing.
+   (charts.py), and the explanation string. If the fallback path fired, a
+   warning banner appears with a debug expander showing the raw error.
+8. Because Streamlit reruns the whole script on every widget interaction,
+   results (including whether the fallback fired, and the raw error) are
+   cached in st.session_state.results on button click so they survive
+   unrelated reruns (e.g. typing further in the craving box) instead of
+   vanishing.
 
 
 3. FILE-BY-FILE (app/)
@@ -78,39 +111,77 @@ OpenAI/Anthropic call or any other external inference.
   cuisine buckets (North Indian, South Indian, Chinese, Italian,
   Continental, Fast Food, Desserts, Beverages; 5 dishes each), each with a
   14-dim vector (0-10 per dim, built positionally via vec(...)) plus
-  cuisine/prep_time_minutes/meal_type metadata. No Streamlit import — plain
-  data.
+  cuisine/prep_time_minutes/meal_type metadata. No Streamlit import,
+  unaffected by the LLM pivot — plain data.
 
-- context_engine.py (150 lines) — the Context Engine. Four delta tables:
-  TIME_DELTAS (4 buckets), MOOD_DELTAS (8 moods), ACTIVITY_DELTAS (6
-  activities), KEYWORD_DELTAS (31 free-text substrings, e.g. "crunchy"
-  -> {crunch: +3}, "fresh" -> {freshness: +3, richness: -1}). Each delta
-  only sets the dimensions it actually affects; everything else defaults to
-  0. get_time_bucket(now) buckets an hour into the 4 time-of-day labels.
-  compute_target_vector(...) is the core function described in section 2.
-  Deliberately flat/explicit dicts, no derived logic — that's the
-  "auditability" story for the RFP. No Streamlit import.
+- context_engine.py (92 lines, shrunk from its pre-pivot rule-engine
+  version) — now a small support module, not the primary context-fusion
+  path. get_time_bucket(now) buckets an hour into the 4 time-of-day labels.
+  TIME_DELTAS (4 buckets) is kept from the old rule-based design and does
+  double duty: a labeled input sent to the LLM, and the backbone of the
+  deterministic fallback vector. QUIZ_QUESTIONS is the mood-quiz question
+  bank (4 optional multiple-choice questions: energy_level, day_descriptor,
+  notable_activity, temperature_preference) that replaced the old single
+  mood chip + activity multiselect. add_delta/clamp_vector are small vector
+  utilities shared with llm_context_engine.py's fallback path. The old
+  MOOD_DELTAS/ACTIVITY_DELTAS/KEYWORD_DELTAS tables are gone. No Streamlit
+  import.
 
-- matching_engine.py (67 lines) — the Matching Engine. cosine_similarity()
+- weather_client.py (47 lines, new) — calls Open-Meteo's free
+  current-weather endpoint for a lat/lon. PRESET_CITIES is the dropdown of
+  major Indian cities (Mumbai, Delhi, Bengaluru, Chennai) plus a "Custom
+  location" option. get_current_weather(lat, lon) returns a dict on success
+  or None on any failure — never raises. No Streamlit import.
+
+- llm_context_engine.py (235 lines, new) — the Context Engine, and the
+  only module that calls an external LLM. build_context_payload(...)
+  assembles the structured dict (time bucket, weather-or-None,
+  biometrics-or-None, quiz answers, craving text) sent as the user-turn
+  content. FlavorVectorResponse (Pydantic, one DimensionScore(value,
+  rationale) per dimension) is passed as output_format to
+  client.messages.parse(...) (model: claude-sonnet-5). get_target_vector
+  (context_payload) wraps the call in a broad try/except and routes any
+  failure to _fallback_vector_and_rationale(...) (see section 2). Always
+  returns a ContextResult(vector, rationale, source, error) — never raises.
+  _get_client() is a small seam (constructs anthropic.Anthropic() lazily,
+  not at import time) that tests monkeypatch directly. No Streamlit import.
+
+- matching_engine.py (58 lines) — the Matching Engine: cosine_similarity()
   (numpy, handles zero-vector edge case by returning 0.0 instead of
-  dividing by zero), rank_dishes() (sorts all dishes best-first),
-  explain_match() (top-dimension + top-source attribution described in
-  section 2). No Streamlit import.
+  dividing by zero) and rank_dishes() (sorts all dishes best-first) are
+  unchanged by the LLM pivot, fully deterministic. explain_match(
+  target_vector, dish, rationale) changed signature: it now takes the
+  LLM-or-fallback-authored rationale dict (previously it derived "why" from
+  the rule-engine's own contributions list, which no longer exists) and
+  pulls per-dimension text from it directly. No Streamlit import.
 
 - charts.py (33 lines) — make_radar_chart(vector, title) builds a Plotly
   go.Scatterpolar figure for one 14-dim vector, closing the polygon by
-  repeating the first point. Only used for per-dish cards today (see
-  "possible additions" below — the target/context vector itself is never
-  visualized).
+  repeating the first point. Unaffected by the LLM pivot. Only used for
+  per-dish cards today — the target/context vector itself is never
+  visualized.
 
-- app.py (86 lines) — Streamlit UI only, no data or matching logic. Wires
-  widgets to the pipeline in section 2 and renders the result cards in a
-  2-column layout.
+- app.py (156 lines, grew substantially from the pivot) — Streamlit UI
+  only, no data or matching logic. Order: auto-detected time bucket ->
+  location + "Check Weather" (own step/button) -> "Connect smartwatch"
+  (simulated sliders) -> mood quiz -> free-text craving -> "Find My Meal"
+  (the one click that calls llm_context_engine.get_target_vector(...)).
+  Calls load_dotenv() at startup (reads app/.env, gitignored;
+  app/.env.example is the committed template). Calls
+  llm_context_engine.get_target_vector(...) and weather_client.
+  get_current_weather(...) via qualified module access (import
+  llm_context_engine, not from-import) — this is the seam that lets tests
+  monkeypatch each function directly.
 
-- tests/ (43 tests total, pytest) — see section 5.
+- tests/ (60 tests total, pytest) — see section 5.
 
 - Makefile — make venv / install / install-dev / run / test / test-verbose
   / clean, wrapping the manual venv+pip+streamlit+pytest commands.
+
+- .claude/hooks/block-env-read.sh + .claude/settings.json (new) — a
+  project-wide PreToolUse hook blocking Claude from viewing app/.env (the
+  file that holds the real ANTHROPIC_API_KEY), so the secret can't leak
+  into a Claude Code transcript even by accident.
 
 
 4. DATA MODEL DETAIL
@@ -118,6 +189,7 @@ OpenAI/Anthropic call or any other external inference.
 - 14 flavor dimensions, each scored 0-10 per dish, all hand-authored to be
   "plausible" per cuisine (e.g. Butter Chicken: richness 9, warmth 8,
   spice 5; Nimbu Pani: acidity 8, freshness 9, moisture 9, spice 1).
+  Unchanged by the LLM pivot.
 - temp_contrast is 0 for every single dish in the current dataset except
   Ice Cream Sundae (6) — this dimension is essentially unused/decorative
   right now. Worth flagging to anyone extending the dataset: either author
@@ -127,59 +199,89 @@ OpenAI/Anthropic call or any other external inference.
   can span multiple meal types) — meal_type is captured but never actually
   used to filter/boost recommendations anywhere in the current pipeline
   (see "possible additions" below).
+- New: the *context* side of the vector math is no longer a flat delta
+  sum — it's authored per-request by an LLM (or, on failure, the small
+  fallback formula in llm_context_engine.py). The dish side of the vectors
+  (dishes.py) is untouched.
 
 
-5. TESTS (app/tests/, 52 tests total via pytest collection, pytest)
+5. TESTS (app/tests/, 60 tests total via pytest collection)
 ------------------------------------------------------------------
-- test_dishes.py (9) — dataset shape: dish count, unique ids/names, all 14
+- test_dishes.py — dataset shape: dish count, unique ids/names, all 14
   dims present and in 0-10, required metadata, vec() positional mapping.
-- test_context_engine.py (23 collected, incl. parametrized cases) — delta-
-  table coverage (every mood/activity has a delta entry), get_time_bucket
-  boundary conditions (parametrized across all 4 bucket edges),
-  compute_target_vector baseline/clamping/case-insensitive keyword
-  matching/no-mood handling, contributions list shape.
-- test_matching_engine.py (10) — cosine_similarity properties (self=1,
-  symmetric, no div-by-zero on a zero vector), rank_dishes ordering,
-  explain_match correctness against small hand-constructed vectors (known
-  expected attribution, not just "didn't crash").
-- test_charts.py (4) — make_radar_chart returns a Figure, closes the
-  polygon, handles every dish in the dataset.
-- test_app.py (6) — integration tests running the real app.py headlessly via
-  streamlit.testing.v1.AppTest (no browser). Covers no-mood-selected path,
-  session-state persistence across an unrelated rerun, different moods
-  producing different top-5 results, and one scenario (Stressed + "Long day
-  at work" + "something crunchy and tangy") whose expected top result is
-  computed independently in the test itself (via context_engine/
-  matching_engine) rather than hardcoded, since the app's time bucket comes
-  from datetime.now() and the "real" answer shifts by time of day.
+  Unchanged by the LLM pivot.
+- test_context_engine.py (shrunk from its pre-pivot version, old
+  mood/activity-delta-coverage tests removed) — TIME_DELTAS bucket
+  coverage and dimension validity, get_time_bucket boundary conditions
+  (parametrized across all 4 bucket edges), and QUIZ_QUESTIONS shape
+  (unique keys, non-empty questions, >=2 options each).
+- test_weather_client.py (new) — get_current_weather mocked against
+  requests.get: success (parses the Open-Meteo payload correctly), and
+  returns None (never raises) on a connection error, a bad HTTP status, or
+  a malformed payload. No real network calls.
+- test_llm_context_engine.py (new) — DimensionScore's clamping validator
+  (above/below range), get_target_vector's happy path, refusal, and
+  exception paths (all via monkeypatching _get_client() to return a fake
+  client — no real Anthropic call), and the deterministic fallback formula
+  (baseline + TIME_DELTAS + fallback-only quiz/keyword deltas, staying
+  within 0-10 and actually varying with input).
+- test_matching_engine.py — cosine_similarity properties (self=1,
+  symmetric, no div-by-zero on a zero vector), rank_dishes ordering, and
+  explain_match correctness against hand-built rationale dicts (updated for
+  the new rationale-dict signature: top-dimension selection, the 2-reason
+  cap for readability, graceful handling of a dimension with no rationale
+  entry).
+- test_charts.py — make_radar_chart returns a Figure, closes the polygon,
+  handles every dish in the dataset. Unchanged by the LLM pivot.
+- test_app.py (substantially rewritten for the pivot) — integration tests
+  running the real app.py headlessly via streamlit.testing.v1.AppTest (no
+  browser), key-based widget lookups (e.g. at.button(key="find_meal_btn"))
+  rather than positional indices since the widget list has grown. None of
+  these make a real Claude API or weather call: llm_context_engine.
+  get_target_vector is monkeypatched module-attribute style to either a
+  fake result (mocked-happy-path / "different inputs" tests) or, for the
+  one test needing an exact numeric expectation, _get_client is
+  monkeypatched to raise so the real fallback code path runs and is
+  asserted against an independently-computed expectation. Also covers: the
+  fallback warning banner (+ debug expander) appearing when forced, and
+  session-state persistence across an unrelated rerun.
 
-All three core logic modules (dishes/context_engine/matching_engine) are
-plain, side-effect-free, Streamlit-free — importable and testable in
-isolation, which is what makes the above possible without a browser.
+The whole suite makes ZERO real network or API calls (every Claude API call
+and every Open-Meteo call is monkeypatched) and runs the same with or
+without ANTHROPIC_API_KEY set. All logic modules (dishes/context_engine/
+weather_client/llm_context_engine/matching_engine) are plain, side-effect-
+free, Streamlit-free — importable and testable in isolation, which is what
+makes the above possible without a browser.
 
 
 6. HOW TO RUN
 ---------------
 cd app
 make install-dev   # venv + requirements.txt + requirements-dev.txt (pytest)
+cp .env.example .env   # then fill in ANTHROPIC_API_KEY
 make run           # streamlit run app.py -> http://localhost:8501
 make test           # pytest, whole suite
 make test-verbose   # pytest -v
 
+Without ANTHROPIC_API_KEY set, the app still runs — it just always shows
+the fallback banner and uses the deterministic baseline vector instead of
+the LLM-authored one.
+
 (Or the manual venv/pip/streamlit/pytest commands — see CLAUDE.md.)
 
-There is no linter configured, no backend, no auth, no persistence — this is
-a static, client-only prototype by design (see prompt.md section 5,
-"Explicitly Out of Scope").
+There is no linter configured, no backend of its own, no auth, no
+persistence — this is a static prototype with one external network
+dependency (the Claude API call) and one optional one (Open-Meteo weather).
 
 
 7. WHAT'S LEFT / POSSIBLE ADDITIONS FOR THE NEXT DEVELOPER
 --------------------------------------------------------------
-This is a proof-of-concept for one narrow claim (flavor vectors + rule-based
-context + cosine similarity beats cuisine browsing), deliberately scoped
-down per prompt.md. Everything below is *not* a bug — it's scope that was
-intentionally left out, but worth knowing about if the project moves beyond
-"prove the concept to a jury" into "build something more complete":
+This is a proof-of-concept for one narrow claim (flavor vectors +
+LLM-fused real-time context + cosine similarity beats cuisine browsing),
+deliberately scoped down per prompt.md. Everything below is *not* a bug —
+it's scope that was intentionally left out, but worth knowing about if the
+project moves beyond "prove the concept to a jury" into "build something
+more complete":
 
 Frontend / UX polish
   - The original spec (prompt.md) asked for a React app; this is Streamlit,
@@ -192,38 +294,40 @@ Frontend / UX polish
   - The target/context flavor vector itself is never visualized — only each
     dish's vector gets a radar chart. Showing the user's *target* vector
     (e.g. overlaid on or next to each dish's radar chart) would make the
-    "why this matched" story even more visually obvious.
+    "why this matched" story even more visually obvious, and would also
+    make the LLM's per-dimension rationale easier to audit at a glance.
   - No loading state / empty state polish beyond a single placeholder
-    caption; no mobile-responsive layout consideration (Streamlit's
-    st.columns(2) is not guaranteed to look good on narrow screens).
-  - No visual distinction for the mood radio buttons beyond Streamlit's
-    default (prompt.md asked for "visually distinct when active" chip
-    styling).
+    caption and the st.spinner during the LLM call; no mobile-responsive
+    layout consideration (Streamlit's column layouts are not guaranteed to
+    look good on narrow screens).
 
 Functionality gaps
   - meal_type metadata exists on every dish but is never used to filter or
     boost results (e.g. someone asking for a meal at 8am currently could get
-    Gulab Jamun ranked #1 purely on vector similarity, even though it's
+    a dessert ranked #1 purely on vector similarity, even though it's
     dessert-only metadata-wise). A meal-type-aware boost/filter would be a
-    natural, still-fully-rule-based next feature.
+    natural next feature and could still be applied deterministically after
+    the LLM call.
   - temp_contrast is effectively a dead dimension (0 for 39/40 dishes) — see
     section 4.
   - No way to give feedback on a result (thumbs up/down) even though a real
-    product would eventually want that signal — out of scope per prompt.md
-    but worth flagging for the "To-Be Process" narrative in the full RFP
+    product would eventually want that signal, and it could be used to
+    fine-tune the LLM prompt over time — out of scope per prompt.md but
+    worth flagging for the "To-Be Process" narrative in the full RFP
     response.
   - No handling for dietary constraints (veg/non-veg/allergens) despite this
     being a natural axis for a food app — not in the current dish metadata
     at all.
+  - The LLM call in llm_context_engine.py is a single, unstreamed
+    request/response — no retry-with-backoff before falling back (it falls
+    back immediately on any exception), and no caching of repeated identical
+    context payloads.
 
 Test coverage gaps
-  - No test currently asserts on KEYWORD_DELTAS coverage the way mood/
-    activity delta coverage is tested (e.g. "every keyword maps to at least
-    one real dimension in DIMENSIONS") — would catch typos in a future
-    delta-table edit.
-  - No test exercises multiple free-text keywords matching simultaneously
-    combined with a mood + multiple activities all firing at once (an
-    "everything at once" stress test), only combinations of 2-3 signals.
+  - No test exercises a genuinely malformed/unexpected Anthropic response
+    shape beyond what the mocked client already models (e.g. partial JSON,
+    unexpected extra fields) — worth adding if the Anthropic SDK's parse
+    behavior changes.
   - No performance/regression test that cosine ranking stays stable/
     correct as the dish dataset grows past 40 (relevant if the dataset is
     ever scaled toward a "real vector database" per the RFP's future-state
@@ -259,5 +363,19 @@ Documentation / RFP narrative
   expectation independently via get_time_bucket/compute_target_vector/
   rank_dishes rather than pinning a stale number. CLAUDE.md's description of
   this test was updated to match.
-  Verified: `make test` (52 tests) passed cleanly after all three fixes —
-  reconfirmed still accurate as of this session (see section 5).
+  Verified: `make test` (52 tests) passed cleanly after all three fixes.
+- Replaced the rule-based context engine with an LLM-driven one (see
+  section 1's "ARCHITECTURAL PIVOT" and section 3 for the full list of
+  file-level changes): removed MOOD_DELTAS/ACTIVITY_DELTAS/KEYWORD_DELTAS
+  and compute_target_vector's rule-based fusion from context_engine.py;
+  added weather_client.py (Open-Meteo integration) and
+  llm_context_engine.py (the Claude Sonnet 5 call, Pydantic response
+  schema, and deterministic fallback); reworked app.py's UI flow to add a
+  weather-check step, simulated smartwatch sliders, and the new mood-quiz
+  question bank in place of the old mood chip + activity multiselect;
+  updated matching_engine.explain_match to consume the new rationale dict
+  instead of the old contributions list; added a project-wide PreToolUse
+  hook (.claude/hooks/block-env-read.sh) blocking Claude from reading
+  app/.env so the real ANTHROPIC_API_KEY can't leak into a transcript;
+  rewrote/expanded the test suite (52 -> 60 tests) to match, all still
+  making zero real network/API calls.
